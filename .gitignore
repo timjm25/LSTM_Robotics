@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Training outputs
+checkpoints/
+eval_output/
+*.pt
+*.pth
+
+# Data (generated locally — use scripts/generate_demo_data.py)
+data/demo/
+
+# Logs
+*.log
+runs/
+wandb/
