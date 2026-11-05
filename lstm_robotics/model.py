@@ -377,9 +377,28 @@ def build_model(cfg: Optional[ModelConfig] = None) -> VisuoMotorLSTM:
 
 
 def load_checkpoint(path: str, device: str = "cpu") -> Tuple[VisuoMotorLSTM, dict]:
-    """Load model + metadata from a checkpoint file."""
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    """Load model + metadata from a checkpoint file (returned model is in eval mode).
+
+    Uses ``torch.load(weights_only=True)``: only tensors, primitives and ModelConfig are
+    accepted, so a tampered checkpoint cannot execute code on load.
+    """
+    import dataclasses
+    from pathlib import Path
+
+    if not Path(path).exists():
+        raise FileNotFoundError(f"checkpoint not found: {path}")
+    with torch.serialization.safe_globals([ModelConfig]):
+        ckpt = torch.load(path, map_location=device, weights_only=True)
+    if not isinstance(ckpt, dict) or "model_state_dict" not in ckpt:
+        raise ValueError(f"{path} is not a VisuoMotorLSTM checkpoint (no model_state_dict)")
     cfg = ckpt.get("model_config", ModelConfig())
+    if isinstance(cfg, dict):
+        known = {f.name for f in dataclasses.fields(ModelConfig)}
+        cfg = ModelConfig(**{k: v for k, v in cfg.items() if k in known})
+    ckpt["model_config"] = cfg
+    ckpt.setdefault("metadata", {})
     model = build_model(cfg)
     model.load_state_dict(ckpt["model_state_dict"])
+    model.to(device)
+    model.eval()
     return model, ckpt

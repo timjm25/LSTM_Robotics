@@ -1,6 +1,6 @@
 """Training and model hyperparameters."""
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 @dataclass
@@ -29,8 +29,15 @@ class ModelConfig:
 
 @dataclass
 class TrainConfig:
-    # Data
+    # Data — exactly one source is used, in this priority:
+    #   data_csv (trajectory log, see lstm_robotics/logs.py) > data_dir (episode dir / .h5)
+    #   > synthetic demo (only when use_synthetic=True)
     data_dir: str = "data/demo"
+    data_csv: str = ""
+    use_synthetic: bool = False
+    synthetic_episodes: int = 200
+    # Per-axis physical scale for dx..dyaw (CSV logs only). None = auto from the data.
+    action_scale: Optional[List[float]] = None
     val_split: float = 0.15
     test_split: float = 0.10
 

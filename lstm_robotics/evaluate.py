@@ -21,8 +21,13 @@ def evaluate(
     model: VisuoMotorLSTM,
     loader: DataLoader,
     device: torch.device,
+    action_scale: Optional[List[float]] = None,
 ) -> Dict[str, float]:
-    """Compute MAE and RMSE per action dimension."""
+    """Compute MAE and RMSE per action dimension.
+
+    With ``action_scale`` (CSV logs), also reports motion MAE in physical units
+    (``mae_phys_<axis>``), i.e. the same units as the imported log.
+    """
     model.eval()
     preds_list: List[np.ndarray] = []
     tgts_list: List[np.ndarray] = []
@@ -49,6 +54,10 @@ def evaluate(
     for i, name in enumerate(ACTION_NAMES):
         metrics[f"mae_{name}"] = float(mae[i])
         metrics[f"rmse_{name}"] = float(rmse[i])
+    if action_scale is not None:
+        scale = np.asarray(action_scale, dtype=np.float64)
+        for i, name in enumerate(ACTION_NAMES[:-1]):
+            metrics[f"mae_phys_{name}"] = float(mae[i] * scale[i])
     metrics["overall_mae"] = float(mae.mean())
     metrics["overall_rmse"] = float(rmse.mean())
     metrics["gripper_accuracy"] = float(gripper_acc)
@@ -77,6 +86,9 @@ def plot_predictions(
     Requires matplotlib — gracefully skips if not installed.
     """
     try:
+        import matplotlib
+        if out_path:
+            matplotlib.use("Agg")  # headless: write the file, no window
         import matplotlib.pyplot as plt
     except ImportError:
         print("[evaluate] matplotlib not installed — skipping plot.")
@@ -115,25 +127,37 @@ def plot_predictions(
 
 def run_evaluation(
     checkpoint_path: str,
-    data_dir: str,
+    data_dir: str = "",
     output_dir: str = "eval_output",
     device_str: str = "cpu",
+    data_csv: str = "",
+    use_synthetic: bool = False,
+    plot: bool = True,
+    num_workers: int = 0,
 ):
     """
-    Full evaluation pipeline: load checkpoint → evaluate → save metrics + plots.
+    Full evaluation pipeline: load checkpoint → evaluate on the test split → save
+    metrics.json (+ predictions.png). CSV logs are re-normalised with the action_scale
+    stored in the checkpoint so metrics are comparable with training.
     """
-    from .config import ModelConfig, TrainConfig
+    from .config import TrainConfig
     from .dataset import make_dataloaders
 
     device = torch.device(device_str)
     model, ckpt = load_checkpoint(checkpoint_path, device_str)
     model = model.to(device)
 
-    model_cfg = ckpt.get("model_config", ModelConfig())
-    train_cfg = TrainConfig(data_dir=data_dir)
+    model_cfg = ckpt["model_config"]
+    meta = ckpt.get("metadata", {}) or {}
+    action_scale = meta.get("action_scale")
+    train_cfg = TrainConfig(
+        data_dir=data_dir or "data/demo", data_csv=data_csv, use_synthetic=use_synthetic,
+        action_scale=action_scale if (data_csv or data_dir.endswith(".csv")) else None,
+        num_workers=num_workers,
+    )
     _, _, test_loader = make_dataloaders(train_cfg, model_cfg)
 
-    metrics = evaluate(model, test_loader, device)
+    metrics = evaluate(model, test_loader, device, action_scale=action_scale)
     print_metrics(metrics)
 
     out = Path(output_dir)
@@ -142,20 +166,20 @@ def run_evaluation(
     with open(out / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
 
-    # Collect a few sequences for the plot
-    preds_list, tgts_list = [], []
-    model.eval()
-    with torch.no_grad():
-        for batch in test_loader:
-            frames = batch["frames"].to(device)
-            pred, _ = model(frames)
-            preds_list.append(pred.cpu().numpy())
-            tgts_list.append(batch["actions"].numpy())
-            if len(preds_list) >= 4:
-                break
-
-    preds_np = np.concatenate(preds_list)
-    tgts_np = np.concatenate(tgts_list)
-    plot_predictions(preds_np, tgts_np, out_path=str(out / "predictions.png"))
+    if plot:
+        preds_list, tgts_list = [], []
+        model.eval()
+        with torch.no_grad():
+            for batch in test_loader:
+                frames = batch["frames"].to(device)
+                pred, _ = model(frames)
+                preds_list.append(pred.cpu().numpy())
+                tgts_list.append(batch["actions"].numpy())
+                if len(preds_list) >= 4:
+                    break
+        preds_np = np.concatenate(preds_list)
+        tgts_np = np.concatenate(tgts_list)
+        plot_predictions(preds_np, tgts_np, out_path=str(out / "predictions.png"),
+                         n_samples=min(4, len(preds_np)))
 
     return metrics

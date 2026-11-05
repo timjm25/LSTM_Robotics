@@ -35,8 +35,11 @@ class Predictor:
     the full trajectory history without buffering all past frames.
     """
 
-    def __init__(self, model: VisuoMotorLSTM, device: str = "cpu"):
+    def __init__(self, model: VisuoMotorLSTM, device: str = "cpu",
+                 metadata: Optional[dict] = None):
         self.model = model.to(device)
+        # From the checkpoint, e.g. {"action_scale": [...]} to convert actions to robot units
+        self.metadata = dict(metadata or {})
         self.model.eval()
         self.device = torch.device(device)
         self.states = None  # ConvLSTM hidden states
@@ -44,8 +47,8 @@ class Predictor:
 
     @classmethod
     def from_checkpoint(cls, path: str, device: str = "cpu") -> "Predictor":
-        model, _ = load_checkpoint(path, device)
-        return cls(model, device)
+        model, ckpt = load_checkpoint(path, device)
+        return cls(model, device, metadata=ckpt.get("metadata", {}))
 
     def reset(self):
         """Reset hidden states — call at the start of each new episode."""

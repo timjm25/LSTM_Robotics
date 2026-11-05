@@ -1,10 +1,11 @@
 """
 Robot video dataset loaders.
 
-Supports three data formats:
-  1. HDF5 episodes  — standard robotics research format (e.g. RoboNet, RT-X)
-  2. Directory of episodes — folders of images + actions.json
-  3. Synthetic generator — for smoke-testing without real data
+Supports four data formats:
+  1. CSV trajectory / sensor log — real robot logs (schema in lstm_robotics/logs.py)
+  2. HDF5 episodes  — standard robotics research format (e.g. RoboNet, RT-X)
+  3. Directory of episodes — folders of images + actions.json
+  4. Synthetic generator — optional demo / smoke test (use_synthetic=True / --demo)
 """
 import json
 import os
@@ -17,6 +18,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 from .config import ModelConfig, TrainConfig
+from .logs import TrajectoryLog, load_frame, load_trajectory_csv
 
 
 # ── Transforms ────────────────────────────────────────────────────────────────
@@ -151,6 +153,60 @@ class EpisodeDirectoryDataset(Dataset):
         brightness = random.uniform(0.8, 1.2)
         frames = (frames * brightness).clamp(-3.0, 3.0)
         return frames
+
+
+# ── CSV trajectory-log dataset (real robot logs) ─────────────────────────────
+
+class CSVTrajectoryDataset(Dataset):
+    """
+    Fixed-length windows over episodes imported from a CSV trajectory log.
+
+    Items: {"frames": (T, C, H, W), "actions": (T, 7)} plus "sensors": (T, n) when the log
+    has sensor_* columns. Actions are normalised with the log's action_scale.
+    """
+
+    def __init__(self, log: TrajectoryLog, cfg: ModelConfig, augment: bool = False,
+                 episode_ids: Optional[List[str]] = None):
+        self.cfg = cfg
+        self.augment = augment
+        self.log = log
+        self.action_scale = log.action_scale
+        keep = None if episode_ids is None else set(episode_ids)
+        self.episodes = [e for e in log.episodes if keep is None or e.episode_id in keep]
+        T = cfg.sequence_length
+        self.index: List[Tuple[int, int]] = [
+            (i, s) for i, ep in enumerate(self.episodes) for s in range(len(ep) - T + 1)
+        ]
+
+    @classmethod
+    def from_csv(cls, path: str, cfg: ModelConfig, action_scale=None, **kw) -> "CSVTrajectoryDataset":
+        log = load_trajectory_csv(path, action_scale=action_scale,
+                                  min_length=cfg.sequence_length)
+        for w in log.warnings:
+            print(f"[dataset] warning: {w}")
+        return cls(log, cfg, **kw)
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        ep_i, start = self.index[idx]
+        ep = self.episodes[ep_i]
+        T = self.cfg.sequence_length
+        frames = torch.stack([
+            _numpy_to_tensor(load_frame(ep.frame_paths[start + t]),
+                             self.cfg.image_height, self.cfg.image_width)
+            for t in range(T)
+        ])
+        if self.augment and random.random() < 0.5:
+            frames = (frames * random.uniform(0.8, 1.2)).clamp(-3.0, 3.0)
+        item = {
+            "frames": frames,
+            "actions": torch.tensor(ep.actions[start: start + T], dtype=torch.float32),
+        }
+        if ep.sensors.shape[1]:
+            item["sensors"] = torch.tensor(ep.sensors[start: start + T], dtype=torch.float32)
+        return item
 
 
 # ── HDF5 dataset (RoboNet / Open X-Embodiment format) ────────────────────────
@@ -292,43 +348,90 @@ class SyntheticRobotDataset(Dataset):
 
 # ── DataLoader factory ────────────────────────────────────────────────────────
 
+def _split_by_episode(ds: "CSVTrajectoryDataset", train_cfg: TrainConfig, model_cfg: ModelConfig):
+    """Episode-level split so overlapping windows never leak between train/val/test."""
+    ids = [e.episode_id for e in ds.episodes]
+    order = np.random.default_rng(train_cfg.seed).permutation(len(ids))
+    n_test = max(1, int(round(len(ids) * train_cfg.test_split)))
+    n_val = max(1, int(round(len(ids) * train_cfg.val_split)))
+    test_ids = [ids[i] for i in order[:n_test]]
+    val_ids = [ids[i] for i in order[n_test:n_test + n_val]]
+    train_ids = [ids[i] for i in order[n_test + n_val:]]
+    mk = lambda sel, aug: CSVTrajectoryDataset(ds.log, model_cfg, augment=aug,  # noqa: E731
+                                               episode_ids=sel)
+    return mk(train_ids, True), mk(val_ids, False), mk(test_ids, False)
+
+
+def build_dataset(train_cfg: TrainConfig, model_cfg: ModelConfig) -> Dataset:
+    """Pick the data source from the config (CSV log > data_dir > synthetic demo)."""
+    if train_cfg.data_csv:
+        return CSVTrajectoryDataset.from_csv(train_cfg.data_csv, model_cfg,
+                                             action_scale=train_cfg.action_scale)
+    data_path = Path(train_cfg.data_dir)
+    if data_path.suffix.lower() == ".csv":
+        return CSVTrajectoryDataset.from_csv(str(data_path), model_cfg,
+                                             action_scale=train_cfg.action_scale)
+    if data_path.exists() and data_path.is_dir() and any(data_path.iterdir()):
+        if any(data_path.glob("*.h5")) or any(data_path.glob("*.hdf5")):
+            h5_file = next(data_path.glob("*.h5*"))
+            return HDF5Dataset(str(h5_file), model_cfg)
+        return EpisodeDirectoryDataset(str(data_path), model_cfg, augment=True)
+    if train_cfg.use_synthetic:
+        print("[dataset] Using SyntheticRobotDataset (demo data, not real robot data).")
+        return SyntheticRobotDataset(n_episodes=train_cfg.synthetic_episodes, cfg=model_cfg,
+                                     seed=train_cfg.seed)
+    raise FileNotFoundError(
+        f"no training data at {data_path!s}. Pass --data_csv <trajectory_log.csv> (see "
+        "data/templates/), --data_dir <episodes dir or .h5>, or --demo for synthetic data."
+    )
+
+
 def make_dataloaders(
     train_cfg: TrainConfig,
     model_cfg: ModelConfig,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
-    Auto-detect data format and return (train, val, test) DataLoaders.
-    Falls back to SyntheticRobotDataset when no data directory exists.
+    Build (train, val, test) DataLoaders from the configured data source.
+
+    CSV logs with >= 3 episodes are split by episode; other sources split by window.
+    Synthetic demo data is used only when train_cfg.use_synthetic is True.
     """
-    data_path = Path(train_cfg.data_dir)
+    full_ds = build_dataset(train_cfg, model_cfg)
+    if len(full_ds) == 0:
+        raise ValueError("dataset has no complete windows; lower --seq_len or add longer episodes")
 
-    if not data_path.exists() or not any(data_path.iterdir()):
-        print("[dataset] No data found — using SyntheticRobotDataset for demo.")
-        full_ds = SyntheticRobotDataset(n_episodes=200, cfg=model_cfg)
-    elif any(data_path.glob("*.h5")) or any(data_path.glob("*.hdf5")):
-        h5_file = next(data_path.glob("*.h5*"))
-        full_ds = HDF5Dataset(str(h5_file), model_cfg)
+    if isinstance(full_ds, CSVTrajectoryDataset) and len(full_ds.episodes) >= 3:
+        train_ds, val_ds, test_ds = _split_by_episode(full_ds, train_cfg, model_cfg)
     else:
-        full_ds = EpisodeDirectoryDataset(str(data_path), model_cfg, augment=True)
+        n = len(full_ds)
+        if n < 3:
+            raise ValueError(f"only {n} training window(s); need at least 3 for train/val/test")
+        n_test = max(1, int(n * train_cfg.test_split))
+        n_val = max(1, int(n * train_cfg.val_split))
+        n_train = n - n_val - n_test
 
-    n = len(full_ds)
-    n_test = max(1, int(n * train_cfg.test_split))
-    n_val = max(1, int(n * train_cfg.val_split))
-    n_train = n - n_val - n_test
-
-    g = torch.Generator()
-    g.manual_seed(train_cfg.seed)
-    train_ds, val_ds, test_ds = torch.utils.data.random_split(
-        full_ds, [n_train, n_val, n_test], generator=g
-    )
+        g = torch.Generator()
+        g.manual_seed(train_cfg.seed)
+        train_ds, val_ds, test_ds = torch.utils.data.random_split(
+            full_ds, [n_train, n_val, n_test], generator=g
+        )
 
     kw = dict(
         batch_size=train_cfg.batch_size,
         num_workers=min(train_cfg.num_workers, os.cpu_count() or 1),
-        pin_memory=train_cfg.pin_memory,
+        pin_memory=train_cfg.pin_memory and torch.cuda.is_available(),
     )
     return (
         DataLoader(train_ds, shuffle=True, **kw),
         DataLoader(val_ds, shuffle=False, **kw),
         DataLoader(test_ds, shuffle=False, **kw),
     )
+
+
+def dataset_action_scale(loader: DataLoader) -> Optional[List[float]]:
+    """The physical action scale behind a loader (CSV logs), or None for other sources."""
+    ds = loader.dataset
+    while isinstance(ds, torch.utils.data.Subset):
+        ds = ds.dataset
+    scale = getattr(ds, "action_scale", None)
+    return None if scale is None else [float(v) for v in scale]
