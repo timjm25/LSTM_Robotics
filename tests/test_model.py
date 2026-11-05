@@ -232,7 +232,9 @@ def test_checkpoint_save_load(tmp_path):
 
     loaded_model, ckpt = load_checkpoint(path)
     assert ckpt["epoch"] == 1
-    # Outputs should match
+    # Outputs should match (eval mode: dropout off; load_checkpoint returns an eval model)
+    model.eval()
+    assert not loaded_model.training
     x = torch.randn(1, cfg.sequence_length, 3, cfg.image_height, cfg.image_width)
     with torch.no_grad():
         out_orig, _ = model(x)

@@ -1,6 +1,8 @@
 """Training loop with early stopping, cosine scheduling, and checkpoint management."""
+import dataclasses
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Dict, Optional
@@ -71,9 +73,12 @@ class Trainer:
         val_loader: DataLoader,
         train_cfg: TrainConfig,
         model_cfg: ModelConfig,
+        metadata: Optional[Dict] = None,
     ):
         self.train_cfg = train_cfg
         self.model_cfg = model_cfg
+        # Stored in every checkpoint, e.g. {"action_scale": [...], "data_source": "..."}
+        self.metadata: Dict = dict(metadata or {})
 
         self.device = self._resolve_device(train_cfg.device)
         self.model = model.to(self.device)
@@ -181,19 +186,22 @@ class Trainer:
 
         return {"loss": total_loss / n, "gripper_acc": total_acc / n}
 
-    def save_checkpoint(self, epoch: int, val_loss: float):
+    def _checkpoint_payload(self, epoch: int, val_loss: float) -> dict:
+        return {
+            "epoch": epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "val_loss": val_loss,
+            "model_config": dataclasses.asdict(self.model_cfg),
+            "history": self.history,
+            "metadata": self.metadata,
+        }
+
+    def save_checkpoint(self, epoch: int, val_loss: float, is_best: bool = False):
         path = self.ckpt_dir / f"epoch_{epoch:03d}_val{val_loss:.4f}.pt"
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": self.model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "val_loss": val_loss,
-                "model_config": self.model_cfg,
-                "history": self.history,
-            },
-            path,
-        )
+        torch.save(self._checkpoint_payload(epoch, val_loss), path)
+        if is_best:
+            shutil.copyfile(path, self.ckpt_dir / "best.pt")
         self.best_checkpoints.append((val_loss, path))
         self.best_checkpoints.sort(key=lambda x: x[0])
         # Prune old checkpoints
@@ -236,14 +244,18 @@ class Trainer:
             is_best = val_m["loss"] < self.best_val_loss
             if is_best:
                 self.best_val_loss = val_m["loss"]
-                self.save_checkpoint(epoch + 1, val_m["loss"])
+                self.save_checkpoint(epoch + 1, val_m["loss"], is_best=True)
                 print(f"  → New best checkpoint saved (val_loss={self.best_val_loss:.4f})")
             elif (epoch + 1) % cfg.save_every == 0:
                 self.save_checkpoint(epoch + 1, val_m["loss"])
 
-        # Save final history
+        # Save final weights + history
+        if cfg.epochs:
+            torch.save(self._checkpoint_payload(cfg.epochs, self.history["val_loss"][-1]),
+                       self.ckpt_dir / "last.pt")
         hist_path = self.ckpt_dir / "history.json"
         with open(hist_path, "w") as f:
             json.dump(self.history, f, indent=2)
-        print(f"\nTraining complete. History saved to {hist_path}")
+        print(f"\nTraining complete. Best weights: {self.ckpt_dir / 'best.pt'}  "
+              f"History: {hist_path}")
         return self.history
