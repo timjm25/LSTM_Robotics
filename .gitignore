@@ -25,3 +25,11 @@ data/demo/
 *.log
 runs/
 wandb/
+
+# Local robot settings (copy .env.example to .env)
+.env
+
+# User data: keep real robot logs out of git (templates are tracked)
+data/*
+!data/templates/
+.pytest_cache/

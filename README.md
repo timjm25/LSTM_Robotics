@@ -140,7 +140,7 @@ deployment on robot compute (Jetson, Coral, Raspberry Pi 5) without a GPU.
 
 ## Data Formats
 
-### 1. Episode Directory (default)
+### 1. Episode Directory
 
 ```
 data/
@@ -166,11 +166,37 @@ episode.h5
     actions               (T, 7)        float32
 ```
 
-### 3. Synthetic (smoke-test, no data needed)
+### 3. CSV trajectory / sensor log (real robot logs)
 
-If `data_dir` is empty or missing the loader automatically generates a
-`SyntheticRobotDataset` with 200 episodes — useful for validating the
-architecture before you have real robot data.
+One row per control step. Templates (clearly labelled `SYNTHETIC_SAMPLE_*` rows, 32 px PNG
+frames): `data/templates/trajectory_log/trajectory_log_template.csv` (delta mode, with sensor
+channels) and `trajectory_log_pose_example.csv` (pose mode).
+
+| column | required | meaning |
+|---|---|---|
+| `episode_id` | yes | demonstration name; rows with the same id form one episode |
+| `timestep` | yes | integer, contiguous within an episode |
+| `frame_path` | yes | camera frame, relative to the CSV folder (`.png/.jpg/.bmp`, or `.npy` (H,W,3) uint8) |
+| `dx,dy,dz,droll,dpitch,dyaw` | one group | commanded end-effector deltas per step |
+| `x,y,z,roll,pitch,yaw` | one group | absolute end-effector pose; deltas are computed (angles wrapped) |
+| `gripper` | yes | 0 = open ... 1 = closed |
+| `timestamp_s` | no | must strictly increase within an episode |
+| `sensor_*` | no | any numeric sensor channels (force, joint angles...); validated and returned with each window as `sensors`, not yet used by the model |
+
+Validation lists every problem with its CSV line number (bad numbers, NaN, gripper outside
+[0, 1], missing frames, timestep gaps/duplicates, non-increasing timestamps) and the CLI exits
+with code 2. Episodes shorter than `--seq_len` are skipped with a warning. Motion is divided
+by a per-axis `action_scale` (auto = max |delta| per axis, or pass `--action_scale` with six
+values) so it fits the model's [-1, 1] output; the scale is saved in the checkpoint and used
+to convert predictions back to robot units. CSV logs with 3+ episodes are split into
+train/val/test **by episode**, so overlapping windows don't leak.
+
+### 4. Synthetic (optional demo)
+
+Pass `--demo` to train on the built-in `SyntheticRobotDataset` (no data needed) — useful for
+checking the pipeline. Without `--demo`, a missing data path is an error rather than a
+silent switch to synthetic data. `scripts/generate_demo_data.py` writes the same kind of
+synthetic data in the episode-directory format.
 
 ---
 
@@ -180,65 +206,73 @@ architecture before you have real robot data.
 
 ```bash
 # Python 3.9+ required
-pip install torch torchvision numpy Pillow matplotlib
+pip install -r requirements.txt
+pip install pytest            # to run the tests
 ```
 
-### Train on synthetic data (no robot required)
+### 1. Bring your own robot logs
 
 ```bash
-python run_train.py
-# → trains for 50 epochs, checkpoints saved to checkpoints/
+python -m lstm_robotics template my_logs/            # example CSV + frames to copy
+python -m lstm_robotics validate my_logs/trajectory_log.csv --seq_len 8
 ```
 
-### Train on real robot data
+### 2. Train, evaluate, reload
 
 ```bash
-# 1. Organise episodes (see Data Formats above)
-# 2. Run training
-python run_train.py \
-  --data_dir /path/to/robot/episodes \
-  --epochs 100 \
-  --batch_size 16 \
-  --backbone mobilenetv2
+python run_train.py --data_csv my_logs/trajectory_log.csv --epochs 100   # or: python -m lstm_robotics train ...
+#   -> checkpoints/best.pt (lowest val loss), checkpoints/last.pt, checkpoints/history.json
+python -m lstm_robotics evaluate --checkpoint checkpoints/best.pt --data_csv my_logs/trajectory_log.csv
+#   -> eval_output/metrics.json (incl. MAE in your log's units) + predictions.png
+
+python run_train.py --demo --epochs 5                                   # synthetic demo
+python run_train.py --demo --image_size 64 --small --epochs 2           # fast CPU smoke test
+python run_train.py --data_dir /path/to/episodes                        # episode dir / .h5
 ```
 
-### Evaluate a checkpoint
+Checkpoints load with `torch.load(weights_only=True)` (`lstm_robotics.model.load_checkpoint`);
+they are git-ignored — don't commit weights.
+
+### 3. Run the policy on a robot (simulated by default)
 
 ```bash
-python run_train.py --eval --checkpoint checkpoints/best.pt
-python scripts/visualise_predictions.py --checkpoint checkpoints/best.pt
+python -m lstm_robotics run --checkpoint checkpoints/best.pt --steps 200 --log runs/run1.csv
+python -m lstm_robotics check-robot          # connect + grab one frame, sends no motion
 ```
+
+The robot is chosen by environment variables (see `.env.example`):
+
+- `LSTM_ROBOT_DRIVER=sim` (default) — `SimulatedRobot`, no hardware.
+- `LSTM_ROBOT_DRIVER=tcp` — `TCPBridgeRobot`: frames from an OpenCV camera
+  (`LSTM_ROBOT_CAMERA`), actions as JSON lines to a bridge process at
+  `LSTM_ROBOT_HOST:LSTM_ROBOT_PORT` that you run next to the robot (vendor SDK / ROS 2).
+  The protocol is documented in `lstm_robotics/robot.py`; `python -m lstm_robotics.bridge`
+  is a dry-run reference bridge that logs commands and moves nothing.
+  Missing settings, an unreachable bridge or an unopenable camera raise
+  `RobotUnavailableError` with what to check (`check-robot` exits with code 3).
+
+Every action passes an `ActionLimiter` (per-step clip, `LSTM_ROBOT_MAX_DELTA`) before it is
+sent, and any error mid-run sends `stop` to the robot. `--log` (with `--save_frames`) writes
+the run in the CSV log schema, so runs can be reviewed or re-imported as training data.
 
 ### Online inference (one frame at a time)
 
 ```bash
-# Single image
-python -m lstm_robotics.predict \
-  --checkpoint checkpoints/best.pt \
-  --image frame.png
-
-# Video file
-python -m lstm_robotics.predict \
-  --checkpoint checkpoints/best.pt \
-  --video episode.mp4 \
+python -m lstm_robotics.predict --checkpoint checkpoints/best.pt --image frame.png
+python -m lstm_robotics.predict --checkpoint checkpoints/best.pt --video episode.mp4 \
   --output predicted_actions.npy
 ```
 
-### Streaming inference (deploy on robot)
-
 ```python
 from lstm_robotics.predict import Predictor
-import numpy as np
+from lstm_robotics.logs import denormalise_actions
 
 predictor = Predictor.from_checkpoint("checkpoints/best.pt")
-
-# Start of episode
+scale = predictor.metadata.get("action_scale")      # set when trained on a CSV log
 predictor.reset()
-
-# At each control tick (~25 Hz)
-for frame_rgb in camera_stream:          # (H, W, 3) uint8
-    action = predictor.step(frame_rgb)   # (7,) float32
-    robot.send(action)
+for frame_rgb in camera_stream:                     # (H, W, 3) uint8
+    action = predictor.step(frame_rgb)              # (7,) normalised
+    physical = denormalise_actions(action, scale)   # robot units
 ```
 
 ---
@@ -254,12 +288,16 @@ LSTM_Robotics/
 │   ├── dataset.py         # EpisodeDirectory, HDF5, Synthetic datasets
 │   ├── train.py           # Trainer, RobotActionLoss, gripper_accuracy
 │   ├── evaluate.py        # Per-axis metrics, prediction plots
-│   └── predict.py         # Predictor (stateful online inference)
+│   ├── predict.py         # Predictor (stateful online inference)
+│   ├── logs.py            # CSV trajectory/sensor log import + validation
+│   ├── robot.py           # RobotInterface, SimulatedRobot, TCPBridgeRobot, run_policy
+│   ├── bridge.py          # dry-run reference robot bridge (TCP JSON lines)
+│   └── cli.py             # python -m lstm_robotics {template,validate,train,evaluate,run,check-robot}
 ├── scripts/
 │   ├── generate_demo_data.py
 │   └── visualise_predictions.py
-├── tests/
-│   └── test_model.py      # 17 unit tests
+├── data/templates/        # example trajectory logs (synthetic, clearly labelled)
+├── tests/                 # 47 tests: model, logs, pipeline, robot adapters
 ├── run_train.py           # Training entry point
 └── requirements.txt
 ```
@@ -269,10 +307,20 @@ LSTM_Robotics/
 ## Tests
 
 ```bash
-python tests/test_model.py
-# → 17 tests covering: ConvLSTMCell, ConvLSTM, backbone,
-#   full model forward/backward, synthetic dataset, loss, checkpointing
+python -m pytest -q
+# → 47 passed (CPU only, ~10 s): model, CSV log import/validation, train -> best.pt ->
+#   load -> evaluate -> run, robot adapters (sim, TCP bridge, failure paths)
 ```
+
+## Still out of scope
+
+- **No trained weights ship** with the repo; train on your own logs.
+- **No vendor-specific robot driver.** Real robots connect through the documented TCP bridge
+  protocol; the robot-side bridge (vendor SDK / ROS 2 node) is yours to write — the dry-run
+  bridge is the template. Action frames/units must match how your logs were recorded.
+- `sensor_*` channels are imported and validated but not yet fed to the model.
+- The safety layer is a per-step clip plus stop-on-error; workspace limits, watchdog and
+  e-stop belong in the robot-side controller (see Regulatory / Safety Notes).
 
 ---
 
